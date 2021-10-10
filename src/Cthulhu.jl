@@ -7,10 +7,13 @@ using InteractiveUtils
 using UUIDs
 using REPL: REPL, AbstractTerminal
 
-using Core: MethodInstance
+import Core: MethodInstance, OpaqueClosure
 const Compiler = Core.Compiler
-import Core.Compiler: MethodMatch, LimitedAccuracy, ignorelimited, specialize_method
+import Core.Compiler: MethodMatch, specialize_method,
+                      widenconst, ignorelimited,
+                      LimitedAccuracy, Const, PartialStruct, InterConditional, PartialOpaque
 import Base: unwrapva, isvarargtype
+
 const mapany = Base.mapany
 
 # branch on https://github.com/JuliaLang/julia/pull/42125
@@ -19,6 +22,15 @@ const mapany = Base.mapany
     import Base: @constprop
 else
     macro constprop(_, ex); esc(ex); end
+end
+
+const IS_OVERHAULED = isdefined(Core.Compiler, :LatticeElement)
+@static if IS_OVERHAULED
+    import Core.Compiler: ⊤, ⊥, LatticeElement, NativeType, LatticeElement, isConst,
+                          isLimitedAccuracy, Argtypes, SSAValueTypes
+else
+    const Argtypes = Vector{Any}
+    const SSAValueTypes = Vector{Any}
 end
 
 Base.@kwdef mutable struct CthulhuConfig
@@ -167,15 +179,36 @@ const descend = descend_code_typed
 
 descend(interp::CthulhuInterpreter, mi::MethodInstance; kwargs...) = _descend(interp, mi; iswarn=false, interruptexc=false, kwargs...)
 
+@static if IS_OVERHAULED
+import Core.Compiler: ConditionalInfo
 function codeinst_rt(code::CodeInstance)
     rettype = code.rettype
     if isdefined(code, :rettype_const)
         rettype_const = code.rettype_const
         if isa(rettype_const, Vector{Any}) && !(Vector{Any} <: rettype)
-            return Core.PartialStruct(rettype, rettype_const)
-        elseif isa(rettype_const, Core.PartialOpaque) && rettype <: Core.OpaqueClosure
+            return PartialStruct(rettype, rettype_const)
+        elseif isa(rettype_const, PartialOpaque) && rettype <: OpaqueClosure
             return rettype_const
-        elseif isa(rettype_const, Core.InterConditional) && !(Core.InterConditional <: rettype)
+        elseif isa(rettype_const, ConditionalInfo) && !(ConditionalInfo <: rettype)
+            @assert rettype_const.inter
+            return InterConditional(rettype_const.slot_id, rettype_const.vtype, rettype_const.elsetype), mi
+        else
+            return Const(rettype_const)
+        end
+    else
+        return rettype
+    end
+end
+else # @static if IS_OVERHAULED
+function codeinst_rt(code::CodeInstance)
+    rettype = code.rettype
+    if isdefined(code, :rettype_const)
+        rettype_const = code.rettype_const
+        if isa(rettype_const, Vector{Any}) && !(Vector{Any} <: rettype)
+            return PartialStruct(rettype, rettype_const)
+        elseif isa(rettype_const, PartialOpaque) && rettype <: OpaqueClosure
+            return rettype_const
+        elseif isa(rettype_const, InterConditional) && !(InterConditional <: rettype)
             return rettype_const
         else
             return Const(rettype_const)
@@ -184,6 +217,7 @@ function codeinst_rt(code::CodeInstance)
         return rettype
     end
 end
+end # @static if IS_OVERHAULED
 
 # `@constprop :aggressive` here in order to make sure the constant propagation of `allow_no_codeinf`
 @constprop :aggressive function lookup(interp::CthulhuInterpreter, mi::MethodInstance, optimize::Bool; allow_no_codeinf::Bool=false)
@@ -193,7 +227,11 @@ end
         infos = interp.unopt[mi].stmt_infos
         slottypes = codeinf.slottypes
         if isnothing(slottypes)
-            slottypes = Any[ Any for i = 1:length(codeinf.slotflags) ]
+            @static if IS_OVERHAULED
+                slottypes = LatticeElement[ ⊤ for i = 1:length(codeinf.slotflags) ]
+            else
+                slottypes = Any[ Any for i = 1:length(codeinf.slotflags) ]
+            end
         end
     else
         codeinst = interp.opt[mi]
@@ -209,7 +247,11 @@ end
             # But with coverage on, the empty function body isn't empty due to :code_coverage_effect expressions.
             codeinf = nothing
             infos = []
-            slottypes = Any[Base.unwrap_unionall(mi.specTypes).parameters...]
+            @static if IS_OVERHAULED
+                slottypes = AbstractLatticce[NativeType(t) for t in Base.unwrap_unionall(mi.specTypes).parameters]
+            else
+                slottypes = Any[Base.unwrap_unionall(mi.specTypes).parameters...]
+            end
         else
             Core.eval(Main, quote
                 interp = $interp
@@ -219,7 +261,7 @@ end
             error("couldn't find the source; inspect `Main.interp` and `Main.mi`")
         end
     end
-    (codeinf, rt, infos, slottypes::Vector{Any})
+    return codeinf, rt, infos, slottypes::Argtypes
 end
 
 ##
